@@ -49,6 +49,8 @@
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/Twist.h>
 #include <rosgraph_msgs/Clock.h>
+#include <geometry_msgs/Pose2D.h>
+#include <angles/angles.h>
 
 #include <std_srvs/Empty.h>
 
@@ -78,6 +80,55 @@ private:
     std::vector<Stg::ModelCamera *> cameramodels;
     std::vector<Stg::ModelRanger *> lasermodels;
     std::vector<Stg::ModelPosition *> positionmodels;
+    std::vector<Stg::Model *> humanmodels;
+
+    typedef struct tagHuman{
+        Stg::Model* model;
+        ros::Publisher pose_pub;
+        ros::Subscriber cmdvel_sub;
+        boost::mutex& msg_lock;
+        geometry_msgs::Twist twist; 
+        ros::Time tm_last;
+        
+        tagHuman(ros::NodeHandle&n, Stg::Model* model, boost::mutex& msg_lock_):msg_lock(msg_lock_){
+            this->model = model;
+            std::string topic = std::string(this->model->Token()) + "/pose";
+            this->pose_pub =  n.advertise<geometry_msgs::Pose2D>(topic, 10);
+            topic = std::string(this->model->Token()) + "/cmd_vel";
+            this->cmdvel_sub = n.subscribe<geometry_msgs::Twist>(topic, 10, boost::bind(&tagHuman::onCmdVel, this, _1));
+            tm_last = ros::Time::now();
+        }
+        virtual ~tagHuman(){}
+        void update(){
+            ros::Time tm = ros::Time::now();
+            double delta = (tm - this->tm_last).toSec();
+            this->tm_last = tm;
+            Stg::Pose p = this->model->GetPose();
+            p.x += this->twist.linear.x * delta;
+            p.y += this->twist.linear.y * delta;
+            p.a += angles::normalize_angle(this->twist.angular.z * delta);
+            this->model->SetPose(p);
+            this->publishPose();
+        }
+        void publishPose(){
+            Stg::Pose p = this->model->GetPose();
+            geometry_msgs::Pose2D msg;
+            msg.x = p.x;
+            msg.y = p.y;
+            msg.theta = p.a;
+            this->pose_pub.publish(msg);
+        }
+        void onCmdVel(const boost::shared_ptr<geometry_msgs::Twist const>& msg){
+            boost::mutex::scoped_lock lock(this->msg_lock);
+            ROS_DEBUG("Recv %s, (%f, %f, %f)", this->model->Token(), msg->linear.x, msg->linear.y, msg->angular.z);                
+            twist = *msg;
+        }
+
+        typedef boost::shared_ptr<tagHuman> Ptr;
+        typedef std::map<std::string, Ptr> Map;
+    } Human;
+
+    Human::Map humans_;
 
     //a structure representing a robot inthe simulator
     struct StageRobot
@@ -229,7 +280,7 @@ StageNode::mapName(const char *name, size_t robotID, size_t deviceID, Stg::Model
 void
 StageNode::ghfunc(Stg::Model* mod, StageNode* node)
 {
-  //printf( "inspecting %s, parent\n", mod->Token() );
+  // printf( "inspecting %s, parent\n", mod->Token() );
 
   if (dynamic_cast<Stg::ModelRanger *>(mod)) {
      node->lasermodels.push_back(dynamic_cast<Stg::ModelRanger *>(mod));
@@ -242,6 +293,10 @@ StageNode::ghfunc(Stg::Model* mod, StageNode* node)
     }
   if (dynamic_cast<Stg::ModelCamera *>(mod)) {
      node->cameramodels.push_back(dynamic_cast<Stg::ModelCamera *>(mod));
+  }
+  if(strstr(mod->Token(), "human") != NULL){
+    node->humanmodels.push_back(mod);
+    ROS_INFO("Append %s for controllable human", mod->Token());
   }
 }
 
@@ -396,6 +451,16 @@ StageNode::SubscribeModels()
     // advertising reset service
     reset_srv_ = n_.advertiseService("reset_positions", &StageNode::cb_reset_srv, this);
 
+    // Subscribe humans
+    for(size_t i = 0, i_end = this->humanmodels.size(); i < i_end; ++i){
+        std::string name = this->humanmodels[i]->Token();
+        if(this->humans_.find(name) != this->humans_.end()){
+            ROS_ERROR("Multiple human %s", name.c_str());
+        }else{
+            ROS_INFO("Subscribed human %s", name.c_str());
+            this->humans_.insert(std::make_pair(name, new Human(this->n_, this->humanmodels[i], this->msg_lock)));
+        }
+    }
     return(0);
 }
 
@@ -738,6 +803,10 @@ StageNode::WorldCallback()
             }
 
         }
+    }
+    // loop on the humans
+    for(Human::Map::iterator it = this->humans_.begin(), it_end = this->humans_.end();it != it_end;++it){
+        it->second->update();
     }
 
     this->base_last_globalpos_time = this->sim_time;
