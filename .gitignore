@@ -1,2 +1,5 @@
 build
 .svn
+
+#Visucal Studio Code
+.vscode
