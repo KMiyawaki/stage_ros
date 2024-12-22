@@ -86,9 +86,11 @@ private:
         ros::Subscriber cmdvel_sub;
         boost::mutex &msg_lock;
         geometry_msgs::Twist twist;
-        ros::Time tm_last;
+        ros::Time tm_last, tm_vel;
+        float cmd_vel_timeout;
 
-        tagHuman(ros::NodeHandle &n, Stg::Model *model, boost::mutex &msg_lock_) : msg_lock(msg_lock_)
+        tagHuman(ros::NodeHandle &n, Stg::Model *model, boost::mutex &msg_lock_, float cmd_vel_timeout_ = 0.2f)
+            : msg_lock(msg_lock_), cmd_vel_timeout(cmd_vel_timeout_)
         {
             this->model = model;
             std::string topic = std::string(this->model->Token()) + "/pose";
@@ -96,6 +98,7 @@ private:
             topic = std::string(this->model->Token()) + "/cmd_vel";
             this->cmdvel_sub = n.subscribe<geometry_msgs::Twist>(topic, 10, boost::bind(&tagHuman::onCmdVel, this, _1));
             tm_last = ros::Time::now();
+            tm_vel = ros::Time::now();
         }
         virtual ~tagHuman() {}
         void update()
@@ -104,15 +107,21 @@ private:
             double delta = (tm - this->tm_last).toSec();
             this->tm_last = tm;
             Stg::Pose p = this->model->GetPose();
-            p.x += this->twist.linear.x * delta;
-            p.y += this->twist.linear.y * delta;
-            p.a += angles::normalize_angle(this->twist.angular.z * delta);
-            this->model->SetPose(p);
-            this->publishPose();
+            if ((tm - this->tm_vel).toSec() < this->cmd_vel_timeout)
+            {
+                p.x += this->twist.linear.x * delta;
+                p.y += this->twist.linear.y * delta;
+                p.a += angles::normalize_angle(this->twist.angular.z * delta);
+                this->model->SetPose(p);
+            }
+            else
+            {
+                this->twist = geometry_msgs::Twist();
+            }
+            this->publishPose(p);
         }
-        void publishPose()
+        void publishPose(const Stg::Pose& p)
         {
-            Stg::Pose p = this->model->GetPose();
             geometry_msgs::Pose2D msg;
             msg.x = p.x;
             msg.y = p.y;
@@ -124,6 +133,7 @@ private:
             boost::mutex::scoped_lock lock(this->msg_lock);
             ROS_DEBUG("Recv %s, (%f, %f, %f)", this->model->Token(), msg->linear.x, msg->linear.y, msg->angular.z);
             twist = *msg;
+            tm_vel = ros::Time::now();
         }
 
         typedef boost::shared_ptr<tagHuman> Ptr;
